@@ -1,0 +1,66 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+      - echo Building .NET 8.0 application...
+      - echo Applying dynamic UI patches for transformed environment...
+      - |
+        # Create inline patches for HomeController
+        cat > /tmp/homecontroller_patch.txt << 'PATCH_EOF'
+                ViewBag.DbHost = Environment.GetEnvironmentVariable("DB_HOST") ?? "localhost";
+                ViewBag.DbPort = Environment.GetEnvironmentVariable("DB_PORT") ?? "3306";
+                
+                // Dynamically detect .NET version
+                ViewBag.DotNetVersion = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription;
+                
+                // Dynamically detect database type from connection string
+                var dbHost = ViewBag.DbHost.ToString().ToLower();
+                if (dbHost.Contains("aurora") || dbHost.Contains("cluster"))
+                {
+                    ViewBag.DatabaseType = "Aurora Serverless v2";
+                }
+                else if (dbHost.Contains("rds"))
+                {
+                    ViewBag.DatabaseType = "RDS MySQL 8.0";
+                }
+                else
+                {
+                    ViewBag.DatabaseType = "MySQL Database";
+                }
+        PATCH_EOF
+        
+        # Apply patch to HomeController
+        awk '/ViewBag.DbHost = Environment.GetEnvironmentVariable\("DB_HOST"\)/{
+          while(getline < "/tmp/homecontroller_patch.txt") print;
+          getline; getline; getline; getline;
+          next
+        }1' OrchardLiteApp/OrchardLite.Web/Controllers/HomeController.cs > /tmp/homecontroller_new.cs
+        mv /tmp/homecontroller_new.cs OrchardLiteApp/OrchardLite.Web/Controllers/HomeController.cs
+      - echo HomeController patched successfully
+  
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...
+      - cd OrchardLiteApp
+      - docker build -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+  
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker images...
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo Writing image definitions file...
+      - printf '[{"name":"orchardlite-app","imageUri":"%s"}]' $REPOSITORY_URI:latest > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
